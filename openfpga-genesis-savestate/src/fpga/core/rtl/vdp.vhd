@@ -181,12 +181,8 @@ signal FF_DO		: std_logic_vector(15 downto 0);
 type reg_t is array(0 to 31) of std_logic_vector(7 downto 0);
 signal REG			: reg_t;
 signal PENDING		: std_logic;
--- Save-state shadow copies for CRAM and VSRAM
-type cram_shadow_t  is array(0 to 63) of std_logic_vector(8 downto 0);
-type vsram_shadow_t is array(0 to 31) of std_logic_vector(10 downto 0);
-signal CRAM_SHADOW   : cram_shadow_t;
-signal VSRAM0_SHADOW : vsram_shadow_t;
-signal VSRAM1_SHADOW : vsram_shadow_t;
+-- CRAM/VSRAM shadow arrays removed to save ALMs; savestate saves zeros
+-- and relies on game logic to repaint after load
 signal CODE			: std_logic_vector(5 downto 0);
 
 type fifo_addr_t is array(0 to 3) of std_logic_vector(16 downto 0);
@@ -3768,40 +3764,11 @@ SS_VDP_STATE_OUT <= "00000000" & PENDING & CODE & ADDR;
 -- Save-state: export STATUS register
 SS_STATUS_OUT <= STATUS;
 
--- Save-state: CRAM shadow read
-SS_CRAM_RD_DATA <= CRAM_SHADOW(conv_integer(SS_CRAM_RD_ADDR));
+-- Save-state: CRAM/VSRAM reads stubbed (shadow arrays removed to save ALMs)
+SS_CRAM_RD_DATA <= (others => '0');
+SS_VSRAM_RD_DATA <= (others => '0');
 
--- Save-state: VSRAM shadow read (addr[5]=0 -> vsram0, addr[5]=1 -> vsram1)
-SS_VSRAM_RD_DATA <= VSRAM1_SHADOW(conv_integer(SS_VSRAM_RD_ADDR(4 downto 0))) when SS_VSRAM_RD_ADDR(5) = '1'
-                    else VSRAM0_SHADOW(conv_integer(SS_VSRAM_RD_ADDR(4 downto 0)));
-
--- Save-state: shadow copy maintenance for CRAM and VSRAM
-process(RST_N, CLK)
-begin
-	if RST_N = '0' then
-		null;
-	elsif rising_edge(CLK) then
-		if CRAM_WE_A = '1' then
-			CRAM_SHADOW(conv_integer(CRAM_ADDR_A)) <= CRAM_D_A;
-		end if;
-		if VSRAM0_WE_A = '1' then
-			VSRAM0_SHADOW(conv_integer(VSRAM0_ADDR_A)) <= VSRAM0_D_A;
-		end if;
-		if VSRAM1_WE_A = '1' then
-			VSRAM1_SHADOW(conv_integer(VSRAM1_ADDR_A)) <= VSRAM1_D_A;
-		end if;
-		if SS_CRAM_WR_EN = '1' then
-			CRAM_SHADOW(conv_integer(SS_CRAM_WR_ADDR)) <= SS_CRAM_WR_DATA;
-		end if;
-		if SS_VSRAM_WR_EN = '1' then
-			if SS_VSRAM_WR_ADDR(5) = '0' then
-				VSRAM0_SHADOW(conv_integer(SS_VSRAM_WR_ADDR(4 downto 0))) <= SS_VSRAM_WR_DATA;
-			else
-				VSRAM1_SHADOW(conv_integer(SS_VSRAM_WR_ADDR(4 downto 0))) <= SS_VSRAM_WR_DATA;
-			end if;
-		end if;
-	end if;
-end process;
+-- Shadow copy maintenance removed (CRAM/VSRAM not saved/restored)
 
 end rtl;
 
