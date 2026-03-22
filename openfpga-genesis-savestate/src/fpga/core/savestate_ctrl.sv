@@ -227,7 +227,7 @@ function [3:0] addr_to_region;
             addr_to_region = RGN_VSRAM0;
         else if (a < VDP_VSRAM1_BASE + 18'h40)  // VSRAM1: 0x22238..0x22277
             addr_to_region = RGN_VSRAM1;
-        else if (a < PSG_BASE)            // FM: 0x22350..0x2254F
+        else if (a >= FM_BASE && a < PSG_BASE)  // FM: 0x22350..0x2254F
             addr_to_region = RGN_FM;
         else if (a < PSG_BASE + 18'h8)    // PSG: 0x22550..0x22557
             addr_to_region = RGN_PSG;
