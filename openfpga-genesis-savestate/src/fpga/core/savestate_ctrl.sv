@@ -184,24 +184,15 @@ wire load_last_byte = ssw_en && (ssw_addr == SS_SIZE - 1);
 // bridge probes (which write non-magic data to 0x5xxxxxxx) from halting
 // the system on boot.
 // -----------------------------------------------------------------------
-reg [2:0] header_match_cnt = 0;
-reg       header_validated  = 0;
+// Simplified header validation: check first 2 bytes "AP" (0x41, 0x50)
+// instead of all 8 magic bytes — saves ~6 ALMs of mux logic.
+reg [1:0] header_match_cnt = 0;  // 0=none, 1=got 'A', 2=got 'P' (validated)
+wire      header_validated  = (header_match_cnt == 2'd2);
 
-wire [7:0] expected_header_byte =
-    (ssw_addr[2:0] == 3'd0) ? 8'h41 :  // 'A'
-    (ssw_addr[2:0] == 3'd1) ? 8'h50 :  // 'P'
-    (ssw_addr[2:0] == 3'd2) ? 8'h46 :  // 'F'
-    (ssw_addr[2:0] == 3'd3) ? 8'h47 :  // 'G'
-    (ssw_addr[2:0] == 3'd4) ? 8'h4E :  // 'N'
-    (ssw_addr[2:0] == 3'd5) ? 8'h30 :  // '0'
-    (ssw_addr[2:0] == 3'd6) ? 8'h30 :  // '0'
-                               8'h31;   // '1'
-
-// Boot holdoff: suppress early halt for ~0.5s after reset to let the
-// 68K execute its reset vector and initialise the VDP before any
-// savestate operation can freeze the system.
-reg [24:0] boot_holdoff_cnt = 0;
-wire       boot_ready = &boot_holdoff_cnt;  // ~0.6s at 54 MHz
+// Boot holdoff: suppress early halt for ~78ms after reset (22-bit @ 54 MHz)
+// to let the 68K execute its reset vector and start VDP initialization.
+reg [21:0] boot_holdoff_cnt = 0;
+wire       boot_ready = &boot_holdoff_cnt;
 
 // -----------------------------------------------------------------------
 // Optimization 2: Registered region enum (replaces 26+ comparators)
@@ -392,7 +383,6 @@ always @(posedge clk) begin
         load_ok    <= 0;
         load_err   <= 0;
         header_match_cnt <= 0;
-        header_validated <= 0;
     end else begin
         case (state)
         // ----------------------------------------------------------------
@@ -438,8 +428,6 @@ always @(posedge clk) begin
             drain_cnt <= drain_cnt + 1;
             if (&drain_cnt) begin   // 128 cycles
                 // Signal firmware: state is frozen, data is ready to read.
-                // Must assert save_ok BEFORE firmware starts reading, since
-                // firmware polls for ok before issuing data_unloader reads.
                 save_ok    <= 1;
                 save_busy  <= 0;
                 state      <= ST_SAVE_READY;
@@ -464,7 +452,6 @@ always @(posedge clk) begin
             save_ack         <= 0;
             save_ok          <= 0;
             header_match_cnt <= 0;
-            header_validated <= 0;
             state            <= ST_IDLE;
         end
 
@@ -527,7 +514,6 @@ always @(posedge clk) begin
             load_busy        <= 0;
             load_ok          <= 1;
             header_match_cnt <= 0;
-            header_validated <= 0;
             state            <= ST_IDLE;
         end
         endcase
@@ -617,22 +603,17 @@ always @(posedge clk) begin
         end
 
         // ---------------------------------------------------------------
-        // Header validation: track the 8-byte magic "APFGN001" at the
-        // start of each savestate load.  Only assert early halt after
-        // all 8 bytes match in sequence.  This prevents spurious APF
-        // bridge probes during boot from halting the system.
+        // Header validation: check first 2 bytes "AP" (0x41, 0x50).
+        // This prevents spurious APF bridge probes during boot from
+        // halting the system while using minimal ALM resources.
         // ---------------------------------------------------------------
-        if (ssw_en && ssw_addr[17:3] == 15'd0 && !header_validated) begin
-            if (ssw_data == expected_header_byte && ssw_addr[2:0] == header_match_cnt)
-                header_match_cnt <= header_match_cnt + 1;
-            else
-                header_match_cnt <= 0;
+        if (ssw_en && !header_validated) begin
+            case (header_match_cnt)
+            2'd0: header_match_cnt <= (ssw_addr == 18'd0 && ssw_data == 8'h41) ? 2'd1 : 2'd0;
+            2'd1: header_match_cnt <= (ssw_addr == 18'd1 && ssw_data == 8'h50) ? 2'd2 : 2'd0;
+            default: ;  // 2'd2 = validated, stay there
+            endcase
         end
-        // Validate when all 8 bytes matched (cnt wraps from 7→0 on the
-        // 8th match, but we detect it at cnt==7 with the 8th byte live)
-        if (header_match_cnt == 3'd7 && ssw_en && ssw_addr[2:0] == 3'd7
-            && ssw_data == 8'h31 && !header_validated)
-            header_validated <= 1;
 
         // ---------------------------------------------------------------
         // Early halt: assert ss_halt as soon as header is validated.
@@ -716,9 +697,7 @@ wire [7:0]  rr_m68k_off    = rr_lo12 - 12'h010;  // M68K_BASE low12 = 0x010
 wire [5:0]  rr_z80reg_off  = rr_lo12 - 12'h110;  // Z80REG_BASE low12 = 0x110
 wire [8:0]  rr_vdp_off     = rr_lo12 - 12'h150;  // VDP_BASE low12 = 0x150
 
-// M68K state byte select: offset 0..77 → select from 624-bit vector
-// This is still a large mux, but it's read-only (no write barrel shifter)
-// and only active during SAVE, so it's acceptable.
+// M68K state byte select: offset 0..127 → select from 1024-bit vector
 reg [7:0] m68k_save_byte;
 always @(*) begin
     m68k_save_byte = 8'h00;
