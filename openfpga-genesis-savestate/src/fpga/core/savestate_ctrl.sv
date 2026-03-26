@@ -6,7 +6,7 @@
 //   0x00010  64KB  WRAM  (68K main RAM, 16-bit port B)
 //   0x10010  64KB  VRAM  (32-bit port B, 4 bytes per VRAM word)
 //   0x20010  8KB   Z80 RAM  (8-bit port B)
-//   0x22010  256B  68K CPU state  (ss_m68k_state[623:0], padded)
+//   0x22010  256B  68K CPU state  (ss_m68k_state[1023:0], padded to 256B)
 //   0x22110  64B   Z80 CPU state  (ss_z80_reg[211:0], padded)
 //   0x22150  512B  VDP state:
 //               [+0x00..+0x1F] REG[0..31]        32B
@@ -98,8 +98,8 @@ module savestate_ctrl #(
     output reg   [7:0] ss_fm_wr_din    = 0,
 
     // 68K CPU (fx68k) state
-    input  wire [623:0] ss_m68k_state,
-    output reg  [623:0] ss_m68k_state_in = 0,
+    input  wire [1023:0] ss_m68k_state,
+    output reg  [1023:0] ss_m68k_state_in = 0,
     output reg          ss_m68k_load     = 0,
 
     // Z80 CPU (T80s) state
@@ -156,8 +156,8 @@ localparam [3:0]
     ST_IDLE       = 4'd0,
     ST_SAVE_ACK   = 4'd1,   // pulse save_ack; start halt
     ST_SAVE_DRAIN = 4'd2,   // wait for DMA to finish (up to 128 cycles)
-    ST_SAVE_RUN   = 4'd3,   // serve data_unloader reads
-    ST_SAVE_DONE  = 4'd4,   // assert save_ok
+    ST_SAVE_READY = 4'd3,   // assert save_ok; wait for data reads to complete
+    ST_SAVE_DONE  = 4'd4,   // clear halt; return to idle
     ST_LOAD_ACK   = 4'd5,   // pulse load_ack; start halt
     ST_LOAD_RUN   = 4'd6,   // receive data_loader writes
     ST_LOAD_APPLY = 4'd7,   // apply accumulated register state
@@ -168,8 +168,40 @@ reg [3:0] state = ST_IDLE;
 // Drain counter (wait for DMA to quiesce)
 reg [6:0] drain_cnt = 0;
 
+// Save-ready timeout counter (~1.2s at 54 MHz = 64M cycles)
+reg [25:0] save_timeout = 0;
+
 // Track whether final byte has been seen during SAVE
 wire save_last = ssr_en && (ssr_addr == SS_SIZE - 1);
+
+// Track whether all LOAD data has been received (may arrive before load command)
+reg load_data_received = 0;
+wire load_last_byte = ssw_en && (ssw_addr == SS_SIZE - 1);
+
+// -----------------------------------------------------------------------
+// Header validation: only assert early halt after the 8-byte magic
+// "APFGN001" has been received in sequence.  This prevents spurious APF
+// bridge probes (which write non-magic data to 0x5xxxxxxx) from halting
+// the system on boot.
+// -----------------------------------------------------------------------
+reg [2:0] header_match_cnt = 0;
+reg       header_validated  = 0;
+
+wire [7:0] expected_header_byte =
+    (ssw_addr[2:0] == 3'd0) ? 8'h41 :  // 'A'
+    (ssw_addr[2:0] == 3'd1) ? 8'h50 :  // 'P'
+    (ssw_addr[2:0] == 3'd2) ? 8'h46 :  // 'F'
+    (ssw_addr[2:0] == 3'd3) ? 8'h47 :  // 'G'
+    (ssw_addr[2:0] == 3'd4) ? 8'h4E :  // 'N'
+    (ssw_addr[2:0] == 3'd5) ? 8'h30 :  // '0'
+    (ssw_addr[2:0] == 3'd6) ? 8'h30 :  // '0'
+                               8'h31;   // '1'
+
+// Boot holdoff: suppress early halt for ~0.5s after reset to let the
+// 68K execute its reset vector and initialise the VDP before any
+// savestate operation can freeze the system.
+reg [24:0] boot_holdoff_cnt = 0;
+wire       boot_ready = &boot_holdoff_cnt;  // ~0.6s at 54 MHz
 
 // -----------------------------------------------------------------------
 // Optimization 2: Registered region enum (replaces 26+ comparators)
@@ -321,7 +353,7 @@ reg [4:0] apply_state = APPLY_M68K;
 //   sr <= {ssw_data, sr[N-1:8]}
 // After all bytes are received, sr contains the correct value.
 
-reg [623:0] load_m68k_sr    = 0;   // 78 bytes (624 bits), addresses 0..77
+reg [1023:0] load_m68k_sr    = 0;   // 128 bytes (1024 bits), addresses 0..127
 reg [215:0] load_z80_sr     = 0;   // 27 bytes (216 bits); only [211:0] used at apply
 reg  [63:0] load_psg_sr     = 0;   // 8 bytes
 reg [255:0] load_vdp_reg_sr = 0;   // 32 bytes
@@ -332,9 +364,8 @@ reg   [7:0] load_cram_lo_buf  = 0;
 reg   [7:0] load_vsram_lo_buf = 0;
 
 always @(posedge clk) begin
-    // Default pulse signals
-    save_ack         <= 0;
-    load_ack         <= 0;
+    // Default pulse signals (save_ack/load_ack are level-based, not pulsed,
+    // to survive CDC crossing via synch_3 from clk_sys to clk_74a)
     ss_psg_load      <= 0;
     ss_m68k_load     <= 0;
     ss_z80_dirset    <= 0;
@@ -343,67 +374,98 @@ always @(posedge clk) begin
     ss_vdp_vsram_wr_en <= 0;
     ss_fm_wr_en      <= 0;
 
+    // Boot holdoff counter: free-run until saturated
+    if (reset)
+        boot_holdoff_cnt <= 0;
+    else if (!boot_ready)
+        boot_holdoff_cnt <= boot_holdoff_cnt + 1;
+
     if (reset) begin
         state      <= ST_IDLE;
         ss_halt    <= 0;
+        save_ack   <= 0;
         save_busy  <= 0;
         save_ok    <= 0;
         save_err   <= 0;
+        load_ack   <= 0;
         load_busy  <= 0;
         load_ok    <= 0;
         load_err   <= 0;
+        header_match_cnt <= 0;
+        header_validated <= 0;
     end else begin
         case (state)
         // ----------------------------------------------------------------
         ST_IDLE: begin
             if (save_start && !save_busy && !load_busy) begin
-                save_ok    <= 0;
-                save_err   <= 0;
-                state      <= ST_SAVE_ACK;
+                save_ok      <= 0;
+                save_err     <= 0;
+                save_timeout <= 0;
+                state        <= ST_SAVE_ACK;
             end else if (load_start && !save_busy && !load_busy) begin
-                load_ok    <= 0;
-                load_err   <= 0;
-                state      <= ST_LOAD_ACK;
+                load_ok      <= 0;
+                load_err     <= 0;
+                state        <= ST_LOAD_ACK;
+            end else if (ss_halt) begin
+                // Early-halt timeout: release if load_start never arrives
+                // (~1.2 s at 54 MHz prevents permanent CPU-halt on spurious writes)
+                save_timeout <= save_timeout + 1;
+                if (&save_timeout) begin
+                    ss_halt      <= 0;
+                    save_timeout <= 0;
+                end
+            end else begin
+                save_timeout <= 0;
             end
         end
 
         // ----------------------------------------------------------------
         ST_SAVE_ACK: begin
-            save_ack   <= 1;
-            save_busy  <= 1;
-            ss_halt    <= 1;
-            drain_cnt  <= 0;
-            state      <= ST_SAVE_DRAIN;
+            save_ack     <= 1;
+            save_busy    <= 1;
+            ss_halt      <= 1;
+            drain_cnt    <= 0;
+            save_timeout <= 0;
+            state        <= ST_SAVE_DRAIN;
         end
 
         // ----------------------------------------------------------------
         ST_SAVE_DRAIN: begin
-            // Wait until VDP DMA is done and count extra safety cycles
-            if (!vbus_sel) begin
-                drain_cnt <= drain_cnt + 1;
-                if (&drain_cnt) begin   // 128 cycles of quiet
-                    state <= ST_SAVE_RUN;
-                end
-            end else begin
-                drain_cnt <= 0;         // reset counter if DMA still active
+            // Fixed delay after halt.  Once ss_halt pauses all clocks the
+            // VDP DMA is frozen, so vbus_sel will never deassert on its
+            // own.  A short fixed wait is sufficient for port-B arbitration
+            // to settle.
+            drain_cnt <= drain_cnt + 1;
+            if (&drain_cnt) begin   // 128 cycles
+                // Signal firmware: state is frozen, data is ready to read.
+                // Must assert save_ok BEFORE firmware starts reading, since
+                // firmware polls for ok before issuing data_unloader reads.
+                save_ok    <= 1;
+                save_busy  <= 0;
+                state      <= ST_SAVE_READY;
             end
         end
 
         // ----------------------------------------------------------------
-        ST_SAVE_RUN: begin
-            // Served by read data mux below (combinatorial path for ssr_data).
-            // Transition to DONE when final byte has been requested.
-            if (save_last) begin
+        ST_SAVE_READY: begin
+            // System stays halted while firmware reads savestate data via
+            // the data_unloader.  Transition to DONE when last byte read,
+            // or after a generous timeout (~1.2s at 54 MHz) to avoid
+            // permanent halt if firmware reads fewer bytes than expected.
+            save_timeout <= save_timeout + 1;
+            if (save_last || &save_timeout) begin
                 state <= ST_SAVE_DONE;
             end
         end
 
         // ----------------------------------------------------------------
         ST_SAVE_DONE: begin
-            ss_halt   <= 0;
-            save_busy <= 0;
-            save_ok   <= 1;
-            state     <= ST_IDLE;
+            ss_halt          <= 0;
+            save_ack         <= 0;
+            save_ok          <= 0;
+            header_match_cnt <= 0;
+            header_validated <= 0;
+            state            <= ST_IDLE;
         end
 
         // ----------------------------------------------------------------
@@ -412,87 +474,18 @@ always @(posedge clk) begin
             load_busy  <= 1;
             ss_halt    <= 1;
             apply_state <= APPLY_M68K;
+            save_timeout <= 0;
             state      <= ST_LOAD_RUN;
         end
 
         // ----------------------------------------------------------------
         ST_LOAD_RUN: begin
-            if (ssw_en) begin
-                // Detect end of savestate
-                if (ssw_addr == SS_SIZE - 1)
-                    state <= ST_LOAD_APPLY;
-
-                case (ssw_region_c)
-                // --- Shift-register accumulation for M68K ---
-                RGN_M68K: begin
-                    if (ssw_m68k_off < 8'd78)  // 78 bytes = 624 bits
-                        load_m68k_sr <= {ssw_data, load_m68k_sr[623:8]};
-                end
-
-                // --- Shift-register accumulation for Z80 ---
-                RGN_Z80REG: begin
-                    if (ssw_z80reg_off < 6'd27)  // 27 bytes → 216 bits
-                        load_z80_sr <= {ssw_data, load_z80_sr[215:8]};
-                end
-
-                // --- Shift-register accumulation for PSG ---
-                RGN_PSG: begin
-                    load_psg_sr <= {ssw_data, load_psg_sr[63:8]};
-                end
-
-                // --- Shift-register for VDP REG ---
-                RGN_VDPREG: begin
-                    load_vdp_reg_sr <= {ssw_data, load_vdp_reg_sr[255:8]};
-                end
-
-                // --- Shift-register for VDP STATE ---
-                RGN_VDPST: begin
-                    if (ssw_vdp_off[2:0] < 3'd4)
-                        load_vdp_state_sr <= {ssw_data, load_vdp_state_sr[31:8]};
-                end
-
-                // --- CRAM inline write (2-byte assembly per entry) ---
-                RGN_CRAM: begin
-                    if (!ssw_addr[0]) begin
-                        load_cram_lo_buf <= ssw_data;
-                    end else begin
-                        ss_vdp_cram_wr_en   <= 1;
-                        ss_vdp_cram_wr_addr <= ssw_cram_off[6:1];
-                        ss_vdp_cram_wr_data <= {ssw_data[0], load_cram_lo_buf};
-                    end
-                end
-
-                // --- VSRAM0 inline write ---
-                RGN_VSRAM0: begin
-                    if (!ssw_addr[0]) begin
-                        load_vsram_lo_buf <= ssw_data;
-                    end else begin
-                        ss_vdp_vsram_wr_en   <= 1;
-                        ss_vdp_vsram_wr_addr <= {1'b0, ssw_vsram0_off[5:1]};
-                        ss_vdp_vsram_wr_data <= {ssw_data[2:0], load_vsram_lo_buf};
-                    end
-                end
-
-                // --- VSRAM1 inline write ---
-                RGN_VSRAM1: begin
-                    if (!ssw_addr[0]) begin
-                        load_vsram_lo_buf <= ssw_data;
-                    end else begin
-                        ss_vdp_vsram_wr_en   <= 1;
-                        ss_vdp_vsram_wr_addr <= {1'b1, ssw_vsram1_off[5:1]};
-                        ss_vdp_vsram_wr_data <= {ssw_data[2:0], load_vsram_lo_buf};
-                    end
-                end
-
-                // --- FM inline write ---
-                RGN_FM: begin
-                    ss_fm_wr_en   <= 1;
-                    ss_fm_wr_addr <= ssw_fm_off;
-                    ss_fm_wr_din  <= ssw_data;
-                end
-
-                default: ;  // WRAM/VRAM/Z80RAM handled in combinatorial block below
-                endcase
+            // Data may have already arrived before the load command
+            // (APF firmware pre-fills bridge buffer, then sends command).
+            // Check load_data_received for pre-arrival, or detect live.
+            save_timeout <= save_timeout + 1;
+            if (load_data_received || load_last_byte || &save_timeout) begin
+                state <= ST_LOAD_APPLY;
             end
         end
 
@@ -529,12 +522,130 @@ always @(posedge clk) begin
 
         // ----------------------------------------------------------------
         ST_LOAD_DONE: begin
-            ss_halt    <= 0;
-            load_busy  <= 0;
-            load_ok    <= 1;
-            state      <= ST_IDLE;
+            ss_halt          <= 0;
+            load_ack         <= 0;
+            load_busy        <= 0;
+            load_ok          <= 1;
+            header_match_cnt <= 0;
+            header_validated <= 0;
+            state            <= ST_IDLE;
         end
         endcase
+
+        // ---------------------------------------------------------------
+        // LOAD data accumulation: always active regardless of FSM state.
+        // APF firmware may write data BEFORE sending the load command
+        // (pre-filling the bridge buffer), so we must capture it whenever
+        // it arrives.  WRAM/VRAM/Z80RAM go through the combinational
+        // block below (already ungated).  Register state is accumulated
+        // into shift registers here.
+        // ---------------------------------------------------------------
+        if (load_last_byte)
+            load_data_received <= 1;
+        // Clear only when the load cycle fully completes.
+        // Previously this also cleared in ST_IDLE (when !load_start), which
+        // caused load_data_received to be 0 every cycle except the exact
+        // cycle where load_last_byte AND load_start arrived simultaneously —
+        // leading to a 1.2-second timeout on every load.  Now we keep the
+        // flag set until load is done so ST_LOAD_RUN transitions immediately.
+        if (state == ST_LOAD_DONE)
+            load_data_received <= 0;
+
+        if (ssw_en) begin
+            case (ssw_region_c)
+            // --- Shift-register accumulation for M68K ---
+            RGN_M68K: begin
+                if (ssw_m68k_off < 8'd128)
+                    load_m68k_sr <= {ssw_data, load_m68k_sr[1023:8]};
+            end
+            // --- Shift-register accumulation for Z80 ---
+            RGN_Z80REG: begin
+                if (ssw_z80reg_off < 6'd27)
+                    load_z80_sr <= {ssw_data, load_z80_sr[215:8]};
+            end
+            // --- Shift-register accumulation for PSG ---
+            RGN_PSG: begin
+                load_psg_sr <= {ssw_data, load_psg_sr[63:8]};
+            end
+            // --- Shift-register for VDP REG ---
+            RGN_VDPREG: begin
+                load_vdp_reg_sr <= {ssw_data, load_vdp_reg_sr[255:8]};
+            end
+            // --- Shift-register for VDP STATE ---
+            RGN_VDPST: begin
+                if (ssw_vdp_off[2:0] < 3'd4)
+                    load_vdp_state_sr <= {ssw_data, load_vdp_state_sr[31:8]};
+            end
+            // --- CRAM inline write ---
+            RGN_CRAM: begin
+                if (!ssw_addr[0]) begin
+                    load_cram_lo_buf <= ssw_data;
+                end else begin
+                    ss_vdp_cram_wr_en   <= 1;
+                    ss_vdp_cram_wr_addr <= ssw_cram_off[6:1];
+                    ss_vdp_cram_wr_data <= {ssw_data[0], load_cram_lo_buf};
+                end
+            end
+            // --- VSRAM0 inline write ---
+            RGN_VSRAM0: begin
+                if (!ssw_addr[0]) begin
+                    load_vsram_lo_buf <= ssw_data;
+                end else begin
+                    ss_vdp_vsram_wr_en   <= 1;
+                    ss_vdp_vsram_wr_addr <= {1'b0, ssw_vsram0_off[5:1]};
+                    ss_vdp_vsram_wr_data <= {ssw_data[2:0], load_vsram_lo_buf};
+                end
+            end
+            // --- VSRAM1 inline write ---
+            RGN_VSRAM1: begin
+                if (!ssw_addr[0]) begin
+                    load_vsram_lo_buf <= ssw_data;
+                end else begin
+                    ss_vdp_vsram_wr_en   <= 1;
+                    ss_vdp_vsram_wr_addr <= {1'b1, ssw_vsram1_off[5:1]};
+                    ss_vdp_vsram_wr_data <= {ssw_data[2:0], load_vsram_lo_buf};
+                end
+            end
+            // --- FM inline write ---
+            RGN_FM: begin
+                ss_fm_wr_en   <= 1;
+                ss_fm_wr_addr <= ssw_fm_off;
+                ss_fm_wr_din  <= ssw_data;
+            end
+            default: ;  // WRAM/VRAM/Z80RAM via combinational block below
+            endcase
+        end
+
+        // ---------------------------------------------------------------
+        // Header validation: track the 8-byte magic "APFGN001" at the
+        // start of each savestate load.  Only assert early halt after
+        // all 8 bytes match in sequence.  This prevents spurious APF
+        // bridge probes during boot from halting the system.
+        // ---------------------------------------------------------------
+        if (ssw_en && ssw_addr[17:3] == 15'd0 && !header_validated) begin
+            if (ssw_data == expected_header_byte && ssw_addr[2:0] == header_match_cnt)
+                header_match_cnt <= header_match_cnt + 1;
+            else
+                header_match_cnt <= 0;
+        end
+        // Validate when all 8 bytes matched (cnt wraps from 7→0 on the
+        // 8th match, but we detect it at cnt==7 with the 8th byte live)
+        if (header_match_cnt == 3'd7 && ssw_en && ssw_addr[2:0] == 3'd7
+            && ssw_data == 8'h31 && !header_validated)
+            header_validated <= 1;
+
+        // ---------------------------------------------------------------
+        // Early halt: assert ss_halt as soon as header is validated.
+        // APF firmware pre-fills the bridge buffer and then sends the
+        // load command, so data bytes arrive while CPUs are still running.
+        // By validating the header first (bytes 0-7) we guarantee the CPU
+        // is paused before any WRAM/VRAM/Z80RAM byte hits memory (those
+        // regions start at offset 0x10+).
+        // This assignment is placed last so it overrides any case branch
+        // that might have cleared ss_halt in the same clock edge.
+        // ---------------------------------------------------------------
+        if (ssw_en && !save_busy && !load_busy && header_validated && boot_ready)
+            ss_halt <= 1;
     end
 end
 
@@ -601,7 +712,7 @@ wire [7:0] vsram_byte =
 // Compute offsets from the low 12 bits of ssr_addr_r (all these regions
 // share addr[17:12] = 0x22x).
 wire [11:0] rr_lo12        = ssr_addr_r[11:0];
-wire [6:0]  rr_m68k_off    = rr_lo12 - 12'h010;  // M68K_BASE low12 = 0x010
+wire [7:0]  rr_m68k_off    = rr_lo12 - 12'h010;  // M68K_BASE low12 = 0x010
 wire [5:0]  rr_z80reg_off  = rr_lo12 - 12'h110;  // Z80REG_BASE low12 = 0x110
 wire [8:0]  rr_vdp_off     = rr_lo12 - 12'h150;  // VDP_BASE low12 = 0x150
 
@@ -611,7 +722,7 @@ wire [8:0]  rr_vdp_off     = rr_lo12 - 12'h150;  // VDP_BASE low12 = 0x150
 reg [7:0] m68k_save_byte;
 always @(*) begin
     m68k_save_byte = 8'h00;
-    if (rr_m68k_off < 7'd78)
+    if (rr_m68k_off < 8'd128)
         m68k_save_byte = ss_m68k_state[rr_m68k_off[6:0]*8 +: 8];
 end
 
@@ -671,9 +782,13 @@ end
 // -----------------------------------------------------------------------
 // LOAD: memory write path (combinatorial, gated by ssw_en)
 // -----------------------------------------------------------------------
-wire ssw_in_wram   = ssw_en && (ssw_region_c == RGN_WRAM);
-wire ssw_in_vram   = ssw_en && (ssw_region_c == RGN_VRAM);
-wire ssw_in_z80ram = ssw_en && (ssw_region_c == RGN_Z80RAM);
+// Gate memory writes with ss_halt: ensures all three bulk RAMs are only
+// written while the CPUs are paused.  The early-halt logic below asserts
+// ss_halt on the very first ssw_en byte (the 16-byte header precedes any
+// WRAM/VRAM data), so by the time real RAM bytes arrive ss_halt is already 1.
+wire ssw_in_wram   = ssw_en && (ssw_region_c == RGN_WRAM)   && ss_halt;
+wire ssw_in_vram   = ssw_en && (ssw_region_c == RGN_VRAM)   && ss_halt;
+wire ssw_in_z80ram = ssw_en && (ssw_region_c == RGN_Z80RAM) && ss_halt;
 
 // VRAM accumulation buffer: VRAM port B is 32-bit with a single wren_b for all
 // byte lanes, so we must assemble 4 bytes before committing a write.

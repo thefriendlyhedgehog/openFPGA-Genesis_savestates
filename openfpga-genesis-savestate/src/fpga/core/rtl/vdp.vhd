@@ -133,7 +133,8 @@ entity vdp is
 		SS_VSRAM_WR_ADDR : in  std_logic_vector(5 downto 0)   := (others => '0');
 		SS_VSRAM_WR_DATA : in  std_logic_vector(10 downto 0)  := (others => '0');
 		SS_VSRAM_RD_ADDR : in  std_logic_vector(5 downto 0)   := (others => '0');
-		SS_VSRAM_RD_DATA : out std_logic_vector(10 downto 0)
+		SS_VSRAM_RD_DATA : out std_logic_vector(10 downto 0);
+		SS_BUSY          : in  std_logic := '0'
 	);
 end vdp;
 
@@ -1371,6 +1372,7 @@ begin
 				BGB_SEL <= '0';
 				BGB_COLINFO_WE_A <= '0';
 			end case;
+		if SS_BUSY = '1' then VSRAM1_ADDR_B <= SS_VSRAM_RD_ADDR(4 downto 0); end if;
 	end if;
 end process;
 
@@ -1705,6 +1707,7 @@ begin
 				BGA_SEL <= '0';
 				BGA_COLINFO_WE_A <= '0';
 			end case;
+		if SS_BUSY = '1' then VSRAM0_ADDR_B <= SS_VSRAM_RD_ADDR(4 downto 0); end if;
 	end if;
 end process;
 
@@ -2733,6 +2736,7 @@ begin
 
 		end if;
 
+		if SS_BUSY = '1' then CRAM_ADDR_B <= SS_CRAM_RD_ADDR; end if;
 	end if;
 end process;
 
@@ -3764,11 +3768,9 @@ SS_VDP_STATE_OUT <= "00000000" & PENDING & CODE & ADDR;
 -- Save-state: export STATUS register
 SS_STATUS_OUT <= STATUS;
 
--- Save-state: CRAM/VSRAM reads stubbed (shadow arrays removed to save ALMs)
-SS_CRAM_RD_DATA <= (others => '0');
-SS_VSRAM_RD_DATA <= (others => '0');
-
--- Shadow copy maintenance removed (CRAM/VSRAM not saved/restored)
+-- Save-state: CRAM/VSRAM reads via port B (muxed by SS_BUSY override in each process)
+SS_CRAM_RD_DATA  <= CRAM_Q_B;
+SS_VSRAM_RD_DATA <= VSRAM0_Q_B when SS_VSRAM_RD_ADDR(5) = '0' else VSRAM1_Q_B;
 
 end rtl;
 

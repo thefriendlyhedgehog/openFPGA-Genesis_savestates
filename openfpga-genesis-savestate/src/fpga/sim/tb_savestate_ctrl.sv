@@ -60,7 +60,7 @@ module tb_savestate_ctrl (
     output wire [10:0] out_vsram_wr_data,
 
     // Loaded state verification
-    output wire [623:0] out_m68k_state_in,
+    output wire [1023:0] out_m68k_state_in,
     output wire [211:0] out_z80_dir,
     output wire  [63:0] out_psg_state_in,
     output wire [255:0] out_vdp_reg_in,
@@ -86,7 +86,7 @@ end
 // Mock peripheral state vectors
 // -----------------------------------------------------------------------
 // M68K: 624 bits = 78 bytes, fill with incrementing pattern
-reg [623:0] mock_m68k_state;
+reg [1023:0] mock_m68k_state;
 initial begin
     for (i = 0; i < 78; i = i + 1)
         mock_m68k_state[i*8 +: 8] = i[7:0] ^ 8'hCC;
@@ -200,7 +200,7 @@ wire        save_ack, save_busy, save_ok, save_err;
 wire        load_ack, load_busy, load_ok, load_err;
 wire [7:0]  ssr_data;
 wire        ss_m68k_load;
-wire [623:0] ss_m68k_state_in;
+wire [1023:0] ss_m68k_state_in;
 wire        ss_z80_dirset;
 wire [211:0] ss_z80_dir;
 wire [63:0] ss_psg_state_in;
@@ -328,6 +328,40 @@ assign out_z80_dir       = ss_z80_dir;
 assign out_psg_state_in  = ss_psg_state_in;
 assign out_vdp_reg_in    = ss_vdp_reg_in;
 assign out_vdp_state_in  = ss_vdp_state_in;
+
+// -----------------------------------------------------------------------
+// Header validation / boot holdoff verification
+// Expose internal signals for C++ harness assertions
+// -----------------------------------------------------------------------
+wire [2:0] dbg_header_match_cnt = uut.header_match_cnt;
+wire       dbg_header_validated = uut.header_validated;
+wire       dbg_boot_ready       = uut.boot_ready;
+
+// -----------------------------------------------------------------------
+// Self-checking assertions (simulation only)
+// -----------------------------------------------------------------------
+`ifdef SIMULATION
+// 1. Spurious write test: ss_halt must stay low if header is not validated
+//    and no save/load command is in progress.
+always @(posedge clk) begin
+    if (!reset && state_idle && !dbg_header_validated && ss_halt)
+        $display("ASSERT FAIL [%0t]: ss_halt high in IDLE without header validation", $time);
+end
+
+wire state_idle = (uut.state == 4'd0);
+
+// 2. Boot holdoff test: ss_halt must stay low during boot holdoff period
+always @(posedge clk) begin
+    if (!reset && !dbg_boot_ready && ss_halt && !save_busy && !load_busy)
+        $display("ASSERT FAIL [%0t]: ss_halt high during boot holdoff", $time);
+end
+
+// 3. Header counter must not exceed 7
+always @(posedge clk) begin
+    if (dbg_header_match_cnt > 3'd7)
+        $display("ASSERT FAIL [%0t]: header_match_cnt overflow: %0d", $time, dbg_header_match_cnt);
+end
+`endif
 
 endmodule
 `default_nettype wire

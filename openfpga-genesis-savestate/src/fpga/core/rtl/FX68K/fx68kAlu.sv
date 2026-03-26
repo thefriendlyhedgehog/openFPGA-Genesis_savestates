@@ -43,7 +43,11 @@ module fx68kAlu ( input clk, pwrUp, enT1, enT3, enT4,
 	output ze,
 	output reg [15:0] alue,
 	output reg [7:0] ccr,
-	output [15:0] aluOut);
+	output [15:0] aluOut,
+	// Save-state
+	input ss_state_load,
+	input [4:0] ss_pswCcr_in,
+	output [4:0] ss_pswCcr);
 
 
 `define ALU_ROW_01		16'h0002
@@ -80,6 +84,7 @@ module fx68kAlu ( input clk, pwrUp, enT1, enT3, enT4,
 
 	assign aluOut = aluLatch;
 	assign ze = ~ccrCore[ ZF];		// Check polarity !!!
+	assign ss_pswCcr = pswCcr;
 
 	//
 	// Control
@@ -447,8 +452,10 @@ module fx68kAlu ( input clk, pwrUp, enT1, enT3, enT4,
 		// Might be possible to update on T4 (but not after T0) from partial result registered on T3, it will increase performance!
 		if( pwrUp)
 			pswCcr <= '0;
+		else if( ss_state_load)
+			pswCcr <= ss_pswCcr_in;
 		else if( enT3 & ftu2Ccr)
-			pswCcr <= ftu[4:0];	
+			pswCcr <= ftu[4:0];
 		else if( enT3 &	~noCcrEn & (finish | init))
 			pswCcr <= ccrMasked;
 	end

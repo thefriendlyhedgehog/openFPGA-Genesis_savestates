@@ -173,8 +173,8 @@ module system
 	input   [7:0] SS_FM_WR_DIN,
 
 	// 68K CPU (fx68k) state
-	output [623:0] SS_M68K_STATE,
-	input  [623:0] SS_M68K_STATE_IN,
+	output [1023:0] SS_M68K_STATE,
+	input  [1023:0] SS_M68K_STATE_IN,
 	input          SS_M68K_LOAD,
 
 	// Z80 CPU (T80s) state
@@ -575,7 +575,8 @@ vdp vdp
 	.SS_VSRAM_WR_ADDR(SS_VDP_VSRAM_WR_ADDR),
 	.SS_VSRAM_WR_DATA(SS_VDP_VSRAM_WR_DATA),
 	.SS_VSRAM_RD_ADDR(SS_VDP_VSRAM_RD_ADDR),
-	.SS_VSRAM_RD_DATA(SS_VDP_VSRAM_RD_DATA)
+	.SS_VSRAM_RD_DATA(SS_VDP_VSRAM_RD_DATA),
+	.SS_BUSY(SS_BUSY)
 );
 
 // PSG 0x10-0x17 in VDP space

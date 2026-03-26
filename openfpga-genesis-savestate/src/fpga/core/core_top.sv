@@ -589,9 +589,11 @@ data_loader #(
 ///////////////////////////////////////////////
 
 // CDC: savestate_start / savestate_load from clk_74a → clk_sys
+// Use rising-edge output — APF protocol expects edge detection, not level
+wire ss_save_start_lvl, ss_load_start_lvl;
 wire ss_save_start_s, ss_load_start_s;
-synch_3 ss_start_cdc (savestate_start, ss_save_start_s, clk_sys);
-synch_3 ss_load_cdc  (savestate_load,  ss_load_start_s, clk_sys);
+synch_3 ss_start_cdc (.i(savestate_start), .o(ss_save_start_lvl), .clk(clk_sys), .rise(ss_save_start_s), .fall());
+synch_3 ss_load_cdc  (.i(savestate_load),  .o(ss_load_start_lvl), .clk(clk_sys), .rise(ss_load_start_s), .fall());
 
 // savestate_ctrl outputs (clk_sys domain)
 wire        ss_save_ack_sys,  ss_save_busy_sys,  ss_save_ok_sys,  ss_save_err_sys;
@@ -676,8 +678,8 @@ wire  [7:0]  ss_fm_rd_data;
 wire         ss_fm_wr_en;
 wire  [8:0]  ss_fm_wr_addr;
 wire  [7:0]  ss_fm_wr_din;
-wire [623:0] ss_m68k_state;
-wire [623:0] ss_m68k_state_in;
+wire [1023:0] ss_m68k_state;
+wire [1023:0] ss_m68k_state_in;
 wire         ss_m68k_load;
 wire [211:0] ss_z80_reg;
 wire         ss_z80_dirset;

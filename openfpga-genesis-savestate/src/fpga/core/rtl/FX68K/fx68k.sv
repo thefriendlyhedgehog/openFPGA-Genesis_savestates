@@ -152,10 +152,10 @@ module fx68k(
 	output [23:1] eab,
 
 	// Save-state snapshot / restore
-	// ss_state_out: [623:592]=padding [591:576]=SR [575:544]=PC [543:0]=regs[0..16] (D0-D7, A0-A6, USP, SSP)
-	output logic [623:0] ss_state_out,
-	input  logic [623:0] ss_state_in,
-	input  logic         ss_state_load    // single-cycle strobe (assert while CPU is halted)
+	// ss_state_out: full microcode + register state for save/restore
+	output logic [1023:0] ss_state_out,
+	input  logic [1023:0] ss_state_in,
+	input  logic          ss_state_load    // single-cycle strobe (assert while CPU is halted)
 	);
 	
 	// wire clock = Clks.clk;
@@ -181,6 +181,14 @@ module fx68k(
 	always_ff @( posedge Clks.clk) begin
 		if( Clks.pwrUp)
 			tState <= T0;
+		else if( ss_state_load)
+			case( ss_state_in[613:611])
+			3'd0: tState <= T0;
+			3'd1: tState <= T1;
+			3'd2: tState <= T2;
+			3'd3: tState <= T3;
+			default: tState <= T4;
+			endcase
 		else begin
 		case( tState)
 		T0: if( Clks.enPhi2) tState <= T4;
@@ -262,14 +270,22 @@ module fx68k(
 			microAddr <= RSTP0_NMA;
 			nanoAddr <= RSTP0_NMA;
 		end
+		else if( ss_state_load) begin
+			microAddr <= ss_state_in[601:592];
+			nanoAddr <= ss_state_in[610:602];
+		end
 		else if( enT1) begin
 			microAddr <= nma;
 			nanoAddr <= orgAddr;				// Register translated uaddr to naddr
 		end
-			
+
 		if( Clks.extReset) begin
 			microLatch <= '0;
 			nanoLatch <= '0;
+		end
+		else if( ss_state_load) begin
+			microLatch <= ss_state_in[630:614];
+			nanoLatch <= ss_state_in[698:631];
 		end
 		else if( rstUrom) begin
 			// Originally reset these bits only. Not strictly needed like this.
@@ -312,7 +328,11 @@ module fx68k(
 
 	// IR & IRD forwarding
 	always_ff @( posedge Clks.clk) begin
-		if( enT1) begin
+		if( ss_state_load) begin
+			Ir <= ss_state_in[714:699];
+			Ird <= ss_state_in[730:715];
+		end
+		else if( enT1) begin
 			if( Nanod.Ir2Ird)
 				Ird <= Ir;
 			else if(microLatch[0])		// prevented by IR => IRD !
@@ -356,6 +376,9 @@ module fx68k(
 	// Wires for excUnit save-state ports
 	wire [575:0] eu_ss_regs_out;
 	wire [31:0]  eu_ss_pc_out;
+	wire [31:0] eu_ss_auReg, eu_ss_aob;
+	wire [15:0] eu_ss_Ath, eu_ss_Atl, eu_ss_Dbl, eu_ss_Dbh, eu_ss_Abl, eu_ss_Abh, eu_ss_Abd, eu_ss_Dbd;
+	wire [4:0]  eu_ss_pswCcr;
 
 	excUnit excUnit( .Clks, .Nanod, .Irdecod, .enT1, .enT2, .enT3, .enT4,
 		.Ird, .ftu, .iEdb, .pswS,
@@ -365,14 +388,70 @@ module fx68k(
 		.ss_pc_out    ( eu_ss_pc_out             ),
 		.ss_regs_in   ( ss_state_in[543:0]       ),   // lower 544b = regs[0..16]
 		.ss_pc_in     ( ss_state_in[575:544]     ),   // next 32b = PC
-		.ss_state_load( ss_state_load            )
+		.ss_state_load( ss_state_load            ),
+		.ss_auReg     ( eu_ss_auReg ),
+		.ss_aob       ( eu_ss_aob ),
+		.ss_Ath       ( eu_ss_Ath ),
+		.ss_Atl       ( eu_ss_Atl ),
+		.ss_Dbl       ( eu_ss_Dbl ),
+		.ss_Dbh       ( eu_ss_Dbh ),
+		.ss_Abl       ( eu_ss_Abl ),
+		.ss_Abh       ( eu_ss_Abh ),
+		.ss_Abd       ( eu_ss_Abd ),
+		.ss_Dbd       ( eu_ss_Dbd ),
+		.ss_aureg_in  ( ss_state_in[796:765] ),
+		.ss_aob_in    ( ss_state_in[828:797] ),
+		.ss_Ath_in    ( ss_state_in[844:829] ),
+		.ss_Atl_in    ( ss_state_in[860:845] ),
+		.ss_Dbl_in    ( ss_state_in[876:861] ),
+		.ss_Dbh_in    ( ss_state_in[892:877] ),
+		.ss_Abl_in    ( ss_state_in[908:893] ),
+		.ss_Abh_in    ( ss_state_in[924:909] ),
+		.ss_Abd_in    ( ss_state_in[940:925] ),
+		.ss_Dbd_in    ( ss_state_in[956:941] ),
+		.ss_pswCcr    ( eu_ss_pswCcr ),
+		.ss_pswCcr_in ( ss_state_in[977:973] ),
+		.ss_irc_in    ( ss_state_in[746:731] )
 	);
 
-	// Pack full state output: regs(544b) + PC(32b) + SR(16b) + pad(32b)
+	// Pack full state output: regs(544b) + PC(32b) + SR(16b) + microcode state + excUnit state
 	assign ss_state_out[543:0]   = eu_ss_regs_out;
 	assign ss_state_out[575:544] = eu_ss_pc_out;
 	assign ss_state_out[591:576] = psw;
-	assign ss_state_out[623:592] = '0;
+
+	// Microcode state
+	assign ss_state_out[601:592] = microAddr;        // 10 bits
+	assign ss_state_out[610:602] = nanoAddr;          // 9 bits
+	assign ss_state_out[613:611] = tState[2:0];       // 3 bits (enum T0=0..T4=4)
+	assign ss_state_out[630:614] = microLatch;        // 17 bits
+	assign ss_state_out[698:631] = nanoLatch;         // 68 bits
+	assign ss_state_out[714:699] = Ir;                // 16 bits
+	assign ss_state_out[730:715] = Ird;               // 16 bits
+	assign ss_state_out[746:731] = Irc;               // 16 bits
+	assign ss_state_out[762:747] = ftu;               // 16 bits
+	assign ss_state_out[763]     = Tpend;             // 1 bit
+	assign ss_state_out[764]     = intPend;           // 1 bit
+
+	// excUnit internal state
+	assign ss_state_out[796:765] = eu_ss_auReg;       // 32 bits
+	assign ss_state_out[828:797] = eu_ss_aob;         // 32 bits
+	assign ss_state_out[844:829] = eu_ss_Ath;         // 16 bits
+	assign ss_state_out[860:845] = eu_ss_Atl;         // 16 bits
+	assign ss_state_out[876:861] = eu_ss_Dbl;         // 16 bits
+	assign ss_state_out[892:877] = eu_ss_Dbh;         // 16 bits
+	assign ss_state_out[908:893] = eu_ss_Abl;         // 16 bits
+	assign ss_state_out[924:909] = eu_ss_Abh;         // 16 bits
+	assign ss_state_out[940:925] = eu_ss_Abd;         // 16 bits
+	assign ss_state_out[956:941] = eu_ss_Dbd;         // 16 bits
+
+	// ALU state
+	assign ss_state_out[972:957] = alue;              // 16 bits
+	assign ss_state_out[977:973] = eu_ss_pswCcr;      // 5 bits (CCR from ALU)
+
+	// Bus control state
+	wire [14:0] bc_ss_out;
+	assign ss_state_out[992:978] = bc_ss_out;         // 15 bits (busControl state)
+	assign ss_state_out[1023:993] = '0;               // padding
 
 	nDecoder3 nDecoder( .Clks, .Nanod, .Irdecod, .enT2, .enT4, .microLatch, .nanoLatch);
 	
@@ -382,7 +461,10 @@ module fx68k(
 		.aob0, .isWrite( Nanod.isWrite), .isRmc( Nanod.isRmc), .isByte( busIsByte), .busAvail,
 		.bciWrite, .addrOe, .bgBlock, .waitBusCycle, .busStarting, .busAddrErr,
 		.rDtack, .BeDebounced, .Vpai,
-		.ASn, .LDSn, .UDSn, .eRWn);
+		.ASn, .LDSn, .UDSn, .eRWn,
+		.ss_state_load( ss_state_load),
+		.ss_bc_out( bc_ss_out),
+		.ss_bc_in( ss_state_in[992:978]));
 		
 	busArbiter busArbiter( .Clks, .BRi, .BgackI, .Halti, .bgBlock, .busAvail, .BGn);
 		
@@ -436,14 +518,17 @@ module fx68k(
 			intPend <= 1'b0;
 			prevNmi <= 1'b0;
 		end
+		else if( ss_state_load) begin
+			intPend <= ss_state_in[764];
+		end
 		else begin
 			if( Clks.enPhi2)
 				prevNmi <= nmi;
-				
+
 			// Originally async RS-Latch on PHI2, followed by a transparent latch on T2
 			// Tricky because they might change simultaneously
 			// Syncronous on PHI2 is equivalent as long as the output is read on T3!
-			
+
 			// Set on stable & NMI edge or compare
 			// Clear on: NMI Iack or (stable & !NMI & !Compare)
 
@@ -452,7 +537,7 @@ module fx68k(
 					intPend <= 1'b1;
 				else if( ((inl == 3'b111) & Iac) | (iplStable & !nmi & !iplComp) )
 					intPend <= 1'b0;
-			end			
+			end
 		end
 		
 		if( Clks.extReset) begin
@@ -567,20 +652,25 @@ module fx68k(
 	
 	// PSW
 	logic irdToCcr_t4;
-	always_ff @( posedge Clks.clk) begin				
+	always_ff @( posedge Clks.clk) begin
 		if( Clks.pwrUp) begin
 			Tpend <= 1'b0;
 			{pswT, pswS, pswI } <= '0;
 			irdToCcr_t4 <= '0;
 		end
-		
+
+		else if( ss_state_load) begin
+			Tpend <= ss_state_in[763];
+			{pswT, pswS, pswI} <= {ss_state_in[591], ss_state_in[589], ss_state_in[586:584]};
+		end
+
 		else if( enT4) begin
 			irdToCcr_t4 <= Irdecod.toCcr;
 		end
-		
+
 		else if( enT3) begin
-		
-			// UNIQUE IF !!	
+
+			// UNIQUE IF !!
 			if( Nanod.updTpend)
 				Tpend <= pswT;
 			else if( Nanod.clrTpend)
@@ -600,8 +690,6 @@ module fx68k(
 				
 		end
 
-	else if( ss_state_load)
-		{pswT, pswS, pswI} <= {ss_state_in[591], ss_state_in[589], ss_state_in[586:584]};
 	end
 		
 	// FTU
@@ -629,6 +717,8 @@ module fx68k(
 			
 		if( Clks.pwrUp)
 			ftu <= '0;
+		else if( ss_state_load)
+			ftu <= ss_state_in[762:747];
 		else if( enT3) begin
 			unique case( 1'b1)
 			Nanod.tvn2Ftu:				ftu <= tvnMux;
@@ -1184,7 +1274,34 @@ module excUnit( input s_clks Clks,
 	// Restore path: load all registers from external input (when CPU is halted)
 	input  logic [575:0] ss_regs_in,
 	input  logic [31:0]  ss_pc_in,
-	input  logic         ss_state_load // single-clock strobe
+	input  logic         ss_state_load, // single-clock strobe
+
+	// Save-state: excUnit internal buses and AU
+	output logic [31:0] ss_auReg,
+	output logic [31:0] ss_aob,
+	output logic [15:0] ss_Ath,
+	output logic [15:0] ss_Atl,
+	output logic [15:0] ss_Dbl,
+	output logic [15:0] ss_Dbh,
+	output logic [15:0] ss_Abl,
+	output logic [15:0] ss_Abh,
+	output logic [15:0] ss_Abd,
+	output logic [15:0] ss_Dbd,
+	input  logic [31:0] ss_aureg_in,
+	input  logic [31:0] ss_aob_in,
+	input  logic [15:0] ss_Ath_in,
+	input  logic [15:0] ss_Atl_in,
+	input  logic [15:0] ss_Dbl_in,
+	input  logic [15:0] ss_Dbh_in,
+	input  logic [15:0] ss_Abl_in,
+	input  logic [15:0] ss_Abh_in,
+	input  logic [15:0] ss_Abd_in,
+	input  logic [15:0] ss_Dbd_in,
+	// ALU CCR save/restore (passed through to fx68kAlu)
+	output logic [4:0]  ss_pswCcr,
+	input  logic [4:0]  ss_pswCcr_in,
+	// Irc restore (passed through to dataIo)
+	input  logic [15:0] ss_irc_in
 	);
 
 localparam REG_USP = 15;
@@ -1228,6 +1345,18 @@ localparam REG_DT = 17;
 		end
 	endgenerate
 	assign ss_pc_out = {PcH, PcL};
+
+	// Save-state: continuous output of internal buses and AU
+	assign ss_auReg = auReg;
+	assign ss_aob = aob;
+	assign ss_Ath = Ath;
+	assign ss_Atl = Atl;
+	assign ss_Dbl = Dbl;
+	assign ss_Dbh = Dbh;
+	assign ss_Abl = Abl;
+	assign ss_Abh = Abh;
+	assign ss_Abd = Abd;
+	assign ss_Dbd = Dbd;
 
 	wire [15:0] aluOut;
 	wire [15:0] dbin;
@@ -1440,8 +1569,16 @@ localparam REG_DT = 17;
 		// Process bus interconnection at T2. Many combinations only used on DIV
 		// We use a simple method. If a specific bus segment is not driven we know that it should get data from a neighbour segment.
 		// In some cases this is not true and the segment is really idle without any destination. But then it doesn't matter.
-		
-		if( enT2) begin
+
+		if( ss_state_load) begin
+			Abh <= ss_Abh_in;
+			Abl <= ss_Abl_in;
+			Abd <= ss_Abd_in;
+			Dbh <= ss_Dbh_in;
+			Dbl <= ss_Dbl_in;
+			Dbd <= ss_Dbd_in;
+		end
+		else if( enT2) begin
 			if( Nanod.extAbh)
 				Abh <= { 16{ ablIdle ? preAbd[ 15] : preAbl[ 15] }};
 			else if( abhIdle)
@@ -1491,8 +1628,10 @@ localparam REG_DT = 17;
 	
 	always_ff @( posedge Clks.clk) begin
 		// UNIQUE IF !
-		
-		if( enT1 & au2Aob)		// From AU we do can on T1
+
+		if( ss_state_load)
+			aob <= ss_aob_in;
+		else if( enT1 & au2Aob)		// From AU we do can on T1
 			aob <= auReg;
 		else if( enT2) begin
 			if( Nanod.db2Aob)
@@ -1539,6 +1678,8 @@ localparam REG_DT = 17;
 	always_ff @( posedge Clks.clk) begin
 		if( Clks.pwrUp)
 			auReg <= '0;
+		else if( ss_state_load)
+			auReg <= ss_aureg_in;
 		else if( enT3 & Nanod.auClkEn)
 			`ifdef SIMULBUGX32
 				auReg <= auResult;
@@ -1637,7 +1778,9 @@ localparam REG_DT = 17;
 		end
 
 		// Unique IF !!!
-		if( enT3) begin
+		if( ss_state_load)
+			Atl <= ss_Atl_in;
+		else if( enT3) begin
 			if( Nanod.dbl2Atl)
 				Atl <= Dbl;
 			else if( Nanod.abl2Atl)
@@ -1645,7 +1788,9 @@ localparam REG_DT = 17;
 		end
 
 		// Unique IF !!!
-		if( enT3) begin
+		if( ss_state_load)
+			Ath <= ss_Ath_in;
+		else if( enT3) begin
 			if( Nanod.abh2Ath)
 				Ath <= Abh;
 			else if( Nanod.dbh2Ath)
@@ -1721,7 +1866,9 @@ localparam REG_DT = 17;
 
 	dataIo dataIo( .Clks, .enT1, .enT2, .enT3, .enT4, .Nanod, .Irdecod,
 			.iEdb, .dobIdle, .dobInput, .aob0,
-			.Irc, .dbin, .oEdb);
+			.Irc, .dbin, .oEdb,
+			.ss_state_load( ss_state_load ),
+			.ss_irc_in( ss_irc_in ));
 
 	fx68kAlu alu(
 		.clk( Clks.clk), .pwrUp( Clks.pwrUp), .enT1, .enT3, .enT4,
@@ -1731,7 +1878,10 @@ localparam REG_DT = 17;
 		.ftu2Ccr( Nanod.ftu2Ccr),
 		.alub, .ftu, .alueClkEn, .alue,
 		.aluDataCtrl( Nanod.aluDctrl), .iDataBus( Dbd), .iAddrBus(Abd),
-		.ze, .aluOut, .ccr);
+		.ze, .aluOut, .ccr,
+		.ss_state_load( ss_state_load ),
+		.ss_pswCcr( ss_pswCcr ),
+		.ss_pswCcr_in( ss_pswCcr_in ));
 
 endmodule
 
@@ -1752,10 +1902,13 @@ module dataIo( input s_clks Clks,
 
 	input dobIdle,
 	input [15:0] dobInput,
-	
-	output logic [15:0] Irc,	
+
+	output logic [15:0] Irc,
 	output logic [15:0] dbin,
-	output logic [15:0] oEdb
+	output logic [15:0] oEdb,
+
+	input logic        ss_state_load,
+	input logic [15:0] ss_irc_in
 	);
 
 	reg [15:0] dob;
@@ -1799,7 +1952,9 @@ module dataIo( input s_clks Clks,
 		// Capture on T4 of the next ucycle
 		// If there are wait states, we keep capturing every PHI2 until the next T1
 		
-		if( xToIrc & Clks.enPhi2)
+		if( ss_state_load)
+			Irc <= ss_irc_in;
+		else if( xToIrc & Clks.enPhi2)
 			Irc <= iEdb;
 		if( xToDbin & Clks.enPhi2) begin
 			// Original connects both halves of EDB.
@@ -2314,9 +2469,13 @@ module busControl( input s_clks Clks, input enT1, input enT4,
 		output busStarting,			// Asserted during S0
 		output logic addrOe,		// Asserted from S1 to the end, whole bus cycle except S0
 		output bciWrite,			// Used for SSW on bus/addr error
-		
+
 		input rDtack, BeDebounced, Vpai,
-		output ASn, output LDSn, output UDSn, eRWn);
+		output ASn, output LDSn, output UDSn, eRWn,
+		// Save-state
+		input  logic        ss_state_load,
+		output logic [14:0] ss_bc_out,
+		input  logic [14:0] ss_bc_in);
 
 	reg rAS, rLDS, rUDS, rRWn;
 	assign ASn = rAS;
@@ -2345,9 +2504,24 @@ module busControl( input s_clks Clks, input enT1, input enT4,
 	
 	enum int unsigned { SRESET = 0, SIDLE, S0, S2, S4, S6, SRMC_RES} busPhase, next;
 
+	// Save-state: pack all busControl state into 15 bits
+	assign ss_bc_out = {isByteT4, addrOeDelay, wendReg, isRmcReg, bciByte, isWriteReg,
+	                    bcPend, addrOe, rRWn, rUDS, rLDS, rAS, busPhase[2:0]};
+
 	always_ff @( posedge Clks.clk) begin
 		if( Clks.extReset)
 			busPhase <= SRESET;
+		else if( ss_state_load)
+			case( ss_bc_in[2:0])
+			3'd0: busPhase <= SRESET;
+			3'd1: busPhase <= SIDLE;
+			3'd2: busPhase <= S0;
+			3'd3: busPhase <= S2;
+			3'd4: busPhase <= S4;
+			3'd5: busPhase <= S6;
+			3'd6: busPhase <= SRMC_RES;
+			default: busPhase <= SIDLE;
+			endcase
 		else if( Clks.enPhi1)
 			busPhase <= next;
 	end
@@ -2398,6 +2572,10 @@ module busControl( input s_clks Clks, input enT1, input enT4,
 		if( Clks.extReset) begin
 			addrOe <= 1'b0;
 		end
+		else if( ss_state_load) begin
+			addrOe <= ss_bc_in[7];
+			addrOeDelay <= ss_bc_in[13];
+		end
 		else if( Clks.enPhi2 & ( busPhase == S0))			// From S1, whole bus cycle except S0
 				addrOe <= 1'b1;
 		else if( Clks.enPhi1 & (busPhase == SRMC_RES))
@@ -2414,6 +2592,12 @@ module busControl( input s_clks Clks, input enT1, input enT4,
 			rLDS <= 1'b1;
 			rRWn <= 1'b1;
 //			dataOe <= '0;
+		end
+		else if( ss_state_load) begin
+			rAS  <= ss_bc_in[3];
+			rLDS <= ss_bc_in[4];
+			rUDS <= ss_bc_in[5];
+			rRWn <= ss_bc_in[6];
 		end
 		else begin
 
@@ -2468,21 +2652,31 @@ module busControl( input s_clks Clks, input enT1, input enT4,
 	
 	// Might make more sense to register this outside this module
 	always_ff @( posedge Clks.clk) begin
-		if( enT4) begin
+		if( ss_state_load)
+			isByteT4 <= ss_bc_in[14];
+		else if( enT4) begin
 			isByteT4 <= isByte;
 		end
 	end
-	
+
 	// Bus Cycle Info Latch
 	always_ff @( posedge Clks.clk) begin
 		if( Clks.pwrUp) begin
 			bcPend <= 1'b0;
-			wendReg <= 1'b0;	
+			wendReg <= 1'b0;
 			isWriteReg <= 1'b0;
 			bciByte <= 1'b0;
-			isRmcReg <= 1'b0;		
+			isRmcReg <= 1'b0;
 		end
-		
+
+		else if( ss_state_load) begin
+			bcPend     <= ss_bc_in[8];
+			isWriteReg <= ss_bc_in[9];
+			bciByte    <= ss_bc_in[10];
+			isRmcReg   <= ss_bc_in[11];
+			wendReg    <= ss_bc_in[12];
+		end
+
 		else if( Clks.enPhi2 & (bciClear | bcReset)) begin
 			bcPend <= 1'b0;
 			wendReg <= 1'b0;
