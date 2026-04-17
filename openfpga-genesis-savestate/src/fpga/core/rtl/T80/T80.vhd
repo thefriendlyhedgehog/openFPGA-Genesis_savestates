@@ -415,6 +415,16 @@ begin
 				PC  <= unsigned(DIR(79 downto 64));
 				A   <= DIR(79 downto 64);
 				IStatus <= DIR(209 downto 208);
+				-- Savestate load: force clean instruction-fetch state so
+				-- the next CEN'd edge starts a fresh M1 at the loaded PC.
+				-- Without this, MCycles/IR/ISet/XY_State carry over the
+				-- Z80's mid-instruction state from before the pause and
+				-- the CPU resumes decoding garbage at the wrong cycle.
+				WZ       <= (others => '0');
+				IR       <= "00000000";
+				ISet     <= "00";
+				XY_State <= "00";
+				MCycles  <= "000";
 
 			elsif ClkEn = '1' then
 				ALU_Op_r <= "0000";
@@ -1079,6 +1089,20 @@ begin
 			if DIRSet = '1' then
 				IntE_FF2 <= DIR(211);
 				IntE_FF1 <= DIR(210);
+				-- Savestate load: force clean cycle-state machine so the
+				-- Z80 resumes with a fresh M1/T1 instruction fetch from
+				-- the loaded PC instead of carrying stale mid-instruction
+				-- MCycle/TState from before the pause.
+				MCycle       <= "001";
+				TState       <= "000";
+				Pre_XY_F_M   <= "000";
+				Halt_FF      <= '0';
+				NMICycle     <= '0';
+				IntCycle     <= '0';
+				No_BTR       <= '0';
+				Auto_Wait_t1 <= '0';
+				Auto_Wait_t2 <= '0';
+				M1_n         <= '1';
 			else
 				if NMI_n = '0' and OldNMI_n = '1' then
 					NMI_s <= '1';

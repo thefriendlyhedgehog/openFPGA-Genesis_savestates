@@ -53,6 +53,15 @@ module savestate_ctrl #(
     // System halt (OR into PAUSE_EN in core_top)
     output reg         ss_halt     = 0,
 
+    // VRAM port B ownership: high only during active save/load data transfer.
+    // Decoupled from ss_halt so the VDP can read VRAM via port B after load
+    // completes (ss_halt may stay high for PAUSE but port B returns to VDP).
+    output wire        ss_vram_sel,
+
+    // High only during LOAD operations (not save). Used in system.sv to
+    // reset Z80 and bus state machines only when loading, not when saving.
+    output wire        ss_loading,
+
     // Data-unloader virtual memory interface (SAVE read path)
     // data_unloader drives read_en / read_addr; we supply read_data
     // INPUT_WORD_SIZE=1 (byte), READ_MEM_CLOCK_DELAY=1
@@ -237,9 +246,15 @@ function [3:0] addr_to_region;
         else if (a < VDP_BASE)            // 0x22110..0x2214F (Z80REG)
             addr_to_region = RGN_Z80REG;
         else if (a < VDP_CRAM_BASE) begin // 0x22150..0x22177
-            // VDP sub-regions: VDP_BASE=0x22150, bit[5] distinguishes
-            // +0x00..+0x1F (REG) vs +0x20..+0x27 (STATE)
-            if (!a[5])
+            // VDP sub-regions: VDP_BASE=0x22150
+            // +0x00..+0x1F (REG): addresses 0x22150-0x2216F
+            // +0x20..+0x27 (STATE): addresses 0x22170-0x22177
+            // Use !(a[5]&a[4]) because:
+            //   REG  0x00-0x0F: a[5]=0,a[4]=1 → AND=0 → !AND=1 → VDPREG ✓
+            //   REG  0x10-0x1F: a[5]=1,a[4]=0 → AND=0 → !AND=1 → VDPREG ✓
+            //   STATE 0x20-0x27: a[5]=1,a[4]=1 → AND=1 → !AND=0 → VDPST ✓
+            // (Previously used !a[5] which misrouted REG 16-31 as VDPST)
+            if (!(a[5] & a[4]))
                 addr_to_region = RGN_VDPREG;
             else
                 addr_to_region = RGN_VDPST;
@@ -326,12 +341,13 @@ wire [2:0] ssw_psg_off = ssw_addr_lo12 - 12'h550;
 // -----------------------------------------------------------------------
 // LOAD_APPLY sub-state
 localparam [4:0]
-    APPLY_M68K  = 5'd0,
-    APPLY_Z80   = 5'd1,
-    APPLY_PSG   = 5'd2,
-    APPLY_VDP   = 5'd3,
-    APPLY_DONE  = 5'd4;
-reg [4:0] apply_state = APPLY_M68K;
+    APPLY_M68K_SETUP = 5'd0,  // Cycle 1: latch data onto ss_m68k_state_in
+    APPLY_M68K_FIRE  = 5'd1,  // Cycle 2: fire ss_m68k_load (data stable)
+    APPLY_Z80   = 5'd2,
+    APPLY_PSG   = 5'd3,
+    APPLY_VDP   = 5'd4,
+    APPLY_DONE  = 5'd5;
+reg [4:0] apply_state = APPLY_M68K_SETUP;
 
 // -----------------------------------------------------------------------
 // Optimization 1: Shift register accumulation buffers
@@ -353,6 +369,7 @@ reg  [31:0] load_vdp_state_sr = 0; // 4 bytes
 // Byte assembly for CRAM/VSRAM (kept as-is, already efficient)
 reg   [7:0] load_cram_lo_buf  = 0;
 reg   [7:0] load_vsram_lo_buf = 0;
+
 
 always @(posedge clk) begin
     // Default pulse signals (save_ack/load_ack are level-based, not pulsed,
@@ -460,7 +477,7 @@ always @(posedge clk) begin
             load_ack   <= 1;
             load_busy  <= 1;
             ss_halt    <= 1;
-            apply_state <= APPLY_M68K;
+            apply_state <= APPLY_M68K_SETUP;
             save_timeout <= 0;
             state      <= ST_LOAD_RUN;
         end
@@ -478,17 +495,38 @@ always @(posedge clk) begin
 
         // ----------------------------------------------------------------
         ST_LOAD_APPLY: begin
-            // Apply accumulated register state in one sequence
+            // ============================================================
+            // DEBUG BUILD B2: 68K state restore — RAW saved state.
+            // No trampoline overrides — just load load_m68k_sr as captured.
+            //
+            // Diagnostic logic: when save→load happens without a power
+            // cycle, the live CPU state equals the saved state, so this
+            // should be a near no-op. If Build B2 crashes too, the bug is
+            // structural (bit layout / fx68k load logic). If it works,
+            // the previous trampoline overrides were the bug.
+            //
+            // Build A  (null overrides): PASSED — halt/resume OK
+            // Build B  (load + NOP trampoline): CRASHED with bad gfx + tone
+            // Build B2 (load + no overrides):   testing now
+            // ============================================================
             case (apply_state)
-            APPLY_M68K: begin
+            // 2-cycle apply for M68K: latch data first, fire strobe next
+            // cycle. This gives the 1024-bit data bus a full clock period
+            // to propagate and settle before fx68k latches on the strobe.
+            APPLY_M68K_SETUP: begin
                 ss_m68k_state_in <= load_m68k_sr;
+                apply_state      <= APPLY_M68K_FIRE;
+            end
+            APPLY_M68K_FIRE: begin
                 ss_m68k_load     <= 1;
                 apply_state      <= APPLY_Z80;
             end
+            // Build B7f: all restores enabled.
+            // VDP uses direct byte-indexed writes + no DMA reset.
             APPLY_Z80: begin
-                ss_z80_dir     <= load_z80_sr[211:0];
-                ss_z80_dirset  <= 1;
-                apply_state    <= APPLY_PSG;
+                ss_z80_dir    <= load_z80_sr[211:0];
+                ss_z80_dirset <= 1;
+                apply_state   <= APPLY_PSG;
             end
             APPLY_PSG: begin
                 ss_psg_state_in <= load_psg_sr;
@@ -496,10 +534,10 @@ always @(posedge clk) begin
                 apply_state     <= APPLY_VDP;
             end
             APPLY_VDP: begin
-                ss_vdp_reg_in    <= load_vdp_reg_sr;
-                ss_vdp_state_in  <= load_vdp_state_sr;
-                ss_vdp_reg_load  <= 1;
-                apply_state      <= APPLY_DONE;
+                ss_vdp_reg_in   <= load_vdp_reg_sr;
+                ss_vdp_state_in <= load_vdp_state_sr;
+                ss_vdp_reg_load <= 1;
+                apply_state     <= APPLY_DONE;
             end
             APPLY_DONE: begin
                 state <= ST_LOAD_DONE;
@@ -509,6 +547,8 @@ always @(posedge clk) begin
 
         // ----------------------------------------------------------------
         ST_LOAD_DONE: begin
+            // Release halt — CPUs resume from restored state.
+            // Z80/PSG/VDP strobes fired in APPLY states above.
             ss_halt          <= 0;
             load_ack         <= 0;
             load_busy        <= 0;
@@ -539,10 +579,143 @@ always @(posedge clk) begin
 
         if (ssw_en) begin
             case (ssw_region_c)
-            // --- Shift-register accumulation for M68K ---
+            // --- Direct byte-indexed write for M68K ---
+            // Each byte goes to its exact position based on address offset.
+            // Immune to byte-ordering or count issues (unlike shift register).
             RGN_M68K: begin
-                if (ssw_m68k_off < 8'd128)
-                    load_m68k_sr <= {ssw_data, load_m68k_sr[1023:8]};
+                if (ssw_m68k_off < 8'd128) begin
+                    case (ssw_m68k_off[6:0])
+                        7'd0:   load_m68k_sr[   7:   0] <= ssw_data;
+                        7'd1:   load_m68k_sr[  15:   8] <= ssw_data;
+                        7'd2:   load_m68k_sr[  23:  16] <= ssw_data;
+                        7'd3:   load_m68k_sr[  31:  24] <= ssw_data;
+                        7'd4:   load_m68k_sr[  39:  32] <= ssw_data;
+                        7'd5:   load_m68k_sr[  47:  40] <= ssw_data;
+                        7'd6:   load_m68k_sr[  55:  48] <= ssw_data;
+                        7'd7:   load_m68k_sr[  63:  56] <= ssw_data;
+                        7'd8:   load_m68k_sr[  71:  64] <= ssw_data;
+                        7'd9:   load_m68k_sr[  79:  72] <= ssw_data;
+                        7'd10:  load_m68k_sr[  87:  80] <= ssw_data;
+                        7'd11:  load_m68k_sr[  95:  88] <= ssw_data;
+                        7'd12:  load_m68k_sr[ 103:  96] <= ssw_data;
+                        7'd13:  load_m68k_sr[ 111: 104] <= ssw_data;
+                        7'd14:  load_m68k_sr[ 119: 112] <= ssw_data;
+                        7'd15:  load_m68k_sr[ 127: 120] <= ssw_data;
+                        7'd16:  load_m68k_sr[ 135: 128] <= ssw_data;
+                        7'd17:  load_m68k_sr[ 143: 136] <= ssw_data;
+                        7'd18:  load_m68k_sr[ 151: 144] <= ssw_data;
+                        7'd19:  load_m68k_sr[ 159: 152] <= ssw_data;
+                        7'd20:  load_m68k_sr[ 167: 160] <= ssw_data;
+                        7'd21:  load_m68k_sr[ 175: 168] <= ssw_data;
+                        7'd22:  load_m68k_sr[ 183: 176] <= ssw_data;
+                        7'd23:  load_m68k_sr[ 191: 184] <= ssw_data;
+                        7'd24:  load_m68k_sr[ 199: 192] <= ssw_data;
+                        7'd25:  load_m68k_sr[ 207: 200] <= ssw_data;
+                        7'd26:  load_m68k_sr[ 215: 208] <= ssw_data;
+                        7'd27:  load_m68k_sr[ 223: 216] <= ssw_data;
+                        7'd28:  load_m68k_sr[ 231: 224] <= ssw_data;
+                        7'd29:  load_m68k_sr[ 239: 232] <= ssw_data;
+                        7'd30:  load_m68k_sr[ 247: 240] <= ssw_data;
+                        7'd31:  load_m68k_sr[ 255: 248] <= ssw_data;
+                        7'd32:  load_m68k_sr[ 263: 256] <= ssw_data;
+                        7'd33:  load_m68k_sr[ 271: 264] <= ssw_data;
+                        7'd34:  load_m68k_sr[ 279: 272] <= ssw_data;
+                        7'd35:  load_m68k_sr[ 287: 280] <= ssw_data;
+                        7'd36:  load_m68k_sr[ 295: 288] <= ssw_data;
+                        7'd37:  load_m68k_sr[ 303: 296] <= ssw_data;
+                        7'd38:  load_m68k_sr[ 311: 304] <= ssw_data;
+                        7'd39:  load_m68k_sr[ 319: 312] <= ssw_data;
+                        7'd40:  load_m68k_sr[ 327: 320] <= ssw_data;
+                        7'd41:  load_m68k_sr[ 335: 328] <= ssw_data;
+                        7'd42:  load_m68k_sr[ 343: 336] <= ssw_data;
+                        7'd43:  load_m68k_sr[ 351: 344] <= ssw_data;
+                        7'd44:  load_m68k_sr[ 359: 352] <= ssw_data;
+                        7'd45:  load_m68k_sr[ 367: 360] <= ssw_data;
+                        7'd46:  load_m68k_sr[ 375: 368] <= ssw_data;
+                        7'd47:  load_m68k_sr[ 383: 376] <= ssw_data;
+                        7'd48:  load_m68k_sr[ 391: 384] <= ssw_data;
+                        7'd49:  load_m68k_sr[ 399: 392] <= ssw_data;
+                        7'd50:  load_m68k_sr[ 407: 400] <= ssw_data;
+                        7'd51:  load_m68k_sr[ 415: 408] <= ssw_data;
+                        7'd52:  load_m68k_sr[ 423: 416] <= ssw_data;
+                        7'd53:  load_m68k_sr[ 431: 424] <= ssw_data;
+                        7'd54:  load_m68k_sr[ 439: 432] <= ssw_data;
+                        7'd55:  load_m68k_sr[ 447: 440] <= ssw_data;
+                        7'd56:  load_m68k_sr[ 455: 448] <= ssw_data;
+                        7'd57:  load_m68k_sr[ 463: 456] <= ssw_data;
+                        7'd58:  load_m68k_sr[ 471: 464] <= ssw_data;
+                        7'd59:  load_m68k_sr[ 479: 472] <= ssw_data;
+                        7'd60:  load_m68k_sr[ 487: 480] <= ssw_data;
+                        7'd61:  load_m68k_sr[ 495: 488] <= ssw_data;
+                        7'd62:  load_m68k_sr[ 503: 496] <= ssw_data;
+                        7'd63:  load_m68k_sr[ 511: 504] <= ssw_data;
+                        7'd64:  load_m68k_sr[ 519: 512] <= ssw_data;
+                        7'd65:  load_m68k_sr[ 527: 520] <= ssw_data;
+                        7'd66:  load_m68k_sr[ 535: 528] <= ssw_data;
+                        7'd67:  load_m68k_sr[ 543: 536] <= ssw_data;
+                        7'd68:  load_m68k_sr[ 551: 544] <= ssw_data;
+                        7'd69:  load_m68k_sr[ 559: 552] <= ssw_data;
+                        7'd70:  load_m68k_sr[ 567: 560] <= ssw_data;
+                        7'd71:  load_m68k_sr[ 575: 568] <= ssw_data;
+                        7'd72:  load_m68k_sr[ 583: 576] <= ssw_data;
+                        7'd73:  load_m68k_sr[ 591: 584] <= ssw_data;
+                        7'd74:  load_m68k_sr[ 599: 592] <= ssw_data;
+                        7'd75:  load_m68k_sr[ 607: 600] <= ssw_data;
+                        7'd76:  load_m68k_sr[ 615: 608] <= ssw_data;
+                        7'd77:  load_m68k_sr[ 623: 616] <= ssw_data;
+                        7'd78:  load_m68k_sr[ 631: 624] <= ssw_data;
+                        7'd79:  load_m68k_sr[ 639: 632] <= ssw_data;
+                        7'd80:  load_m68k_sr[ 647: 640] <= ssw_data;
+                        7'd81:  load_m68k_sr[ 655: 648] <= ssw_data;
+                        7'd82:  load_m68k_sr[ 663: 656] <= ssw_data;
+                        7'd83:  load_m68k_sr[ 671: 664] <= ssw_data;
+                        7'd84:  load_m68k_sr[ 679: 672] <= ssw_data;
+                        7'd85:  load_m68k_sr[ 687: 680] <= ssw_data;
+                        7'd86:  load_m68k_sr[ 695: 688] <= ssw_data;
+                        7'd87:  load_m68k_sr[ 703: 696] <= ssw_data;
+                        7'd88:  load_m68k_sr[ 711: 704] <= ssw_data;
+                        7'd89:  load_m68k_sr[ 719: 712] <= ssw_data;
+                        7'd90:  load_m68k_sr[ 727: 720] <= ssw_data;
+                        7'd91:  load_m68k_sr[ 735: 728] <= ssw_data;
+                        7'd92:  load_m68k_sr[ 743: 736] <= ssw_data;
+                        7'd93:  load_m68k_sr[ 751: 744] <= ssw_data;
+                        7'd94:  load_m68k_sr[ 759: 752] <= ssw_data;
+                        7'd95:  load_m68k_sr[ 767: 760] <= ssw_data;
+                        7'd96:  load_m68k_sr[ 775: 768] <= ssw_data;
+                        7'd97:  load_m68k_sr[ 783: 776] <= ssw_data;
+                        7'd98:  load_m68k_sr[ 791: 784] <= ssw_data;
+                        7'd99:  load_m68k_sr[ 799: 792] <= ssw_data;
+                        7'd100: load_m68k_sr[ 807: 800] <= ssw_data;
+                        7'd101: load_m68k_sr[ 815: 808] <= ssw_data;
+                        7'd102: load_m68k_sr[ 823: 816] <= ssw_data;
+                        7'd103: load_m68k_sr[ 831: 824] <= ssw_data;
+                        7'd104: load_m68k_sr[ 839: 832] <= ssw_data;
+                        7'd105: load_m68k_sr[ 847: 840] <= ssw_data;
+                        7'd106: load_m68k_sr[ 855: 848] <= ssw_data;
+                        7'd107: load_m68k_sr[ 863: 856] <= ssw_data;
+                        7'd108: load_m68k_sr[ 871: 864] <= ssw_data;
+                        7'd109: load_m68k_sr[ 879: 872] <= ssw_data;
+                        7'd110: load_m68k_sr[ 887: 880] <= ssw_data;
+                        7'd111: load_m68k_sr[ 895: 888] <= ssw_data;
+                        7'd112: load_m68k_sr[ 903: 896] <= ssw_data;
+                        7'd113: load_m68k_sr[ 911: 904] <= ssw_data;
+                        7'd114: load_m68k_sr[ 919: 912] <= ssw_data;
+                        7'd115: load_m68k_sr[ 927: 920] <= ssw_data;
+                        7'd116: load_m68k_sr[ 935: 928] <= ssw_data;
+                        7'd117: load_m68k_sr[ 943: 936] <= ssw_data;
+                        7'd118: load_m68k_sr[ 951: 944] <= ssw_data;
+                        7'd119: load_m68k_sr[ 959: 952] <= ssw_data;
+                        7'd120: load_m68k_sr[ 967: 960] <= ssw_data;
+                        7'd121: load_m68k_sr[ 975: 968] <= ssw_data;
+                        7'd122: load_m68k_sr[ 983: 976] <= ssw_data;
+                        7'd123: load_m68k_sr[ 991: 984] <= ssw_data;
+                        7'd124: load_m68k_sr[ 999: 992] <= ssw_data;
+                        7'd125: load_m68k_sr[1007:1000] <= ssw_data;
+                        7'd126: load_m68k_sr[1015:1008] <= ssw_data;
+                        7'd127: load_m68k_sr[1023:1016] <= ssw_data;
+                        default: ;
+                    endcase
+                end
             end
             // --- Shift-register accumulation for Z80 ---
             RGN_Z80REG: begin
@@ -553,14 +726,54 @@ always @(posedge clk) begin
             RGN_PSG: begin
                 load_psg_sr <= {ssw_data, load_psg_sr[63:8]};
             end
-            // --- Shift-register for VDP REG ---
+            // --- Direct byte-indexed write for VDP REG ---
+            // Same fix as M68K: immune to byte count/ordering issues.
             RGN_VDPREG: begin
-                load_vdp_reg_sr <= {ssw_data, load_vdp_reg_sr[255:8]};
+                case (ssw_vdp_off[4:0])
+                    5'd0:  load_vdp_reg_sr[   7:   0] <= ssw_data;
+                    5'd1:  load_vdp_reg_sr[  15:   8] <= ssw_data;
+                    5'd2:  load_vdp_reg_sr[  23:  16] <= ssw_data;
+                    5'd3:  load_vdp_reg_sr[  31:  24] <= ssw_data;
+                    5'd4:  load_vdp_reg_sr[  39:  32] <= ssw_data;
+                    5'd5:  load_vdp_reg_sr[  47:  40] <= ssw_data;
+                    5'd6:  load_vdp_reg_sr[  55:  48] <= ssw_data;
+                    5'd7:  load_vdp_reg_sr[  63:  56] <= ssw_data;
+                    5'd8:  load_vdp_reg_sr[  71:  64] <= ssw_data;
+                    5'd9:  load_vdp_reg_sr[  79:  72] <= ssw_data;
+                    5'd10: load_vdp_reg_sr[  87:  80] <= ssw_data;
+                    5'd11: load_vdp_reg_sr[  95:  88] <= ssw_data;
+                    5'd12: load_vdp_reg_sr[ 103:  96] <= ssw_data;
+                    5'd13: load_vdp_reg_sr[ 111: 104] <= ssw_data;
+                    5'd14: load_vdp_reg_sr[ 119: 112] <= ssw_data;
+                    5'd15: load_vdp_reg_sr[ 127: 120] <= ssw_data;
+                    5'd16: load_vdp_reg_sr[ 135: 128] <= ssw_data;
+                    5'd17: load_vdp_reg_sr[ 143: 136] <= ssw_data;
+                    5'd18: load_vdp_reg_sr[ 151: 144] <= ssw_data;
+                    5'd19: load_vdp_reg_sr[ 159: 152] <= ssw_data;
+                    5'd20: load_vdp_reg_sr[ 167: 160] <= ssw_data;
+                    5'd21: load_vdp_reg_sr[ 175: 168] <= ssw_data;
+                    5'd22: load_vdp_reg_sr[ 183: 176] <= ssw_data;
+                    5'd23: load_vdp_reg_sr[ 191: 184] <= ssw_data;
+                    5'd24: load_vdp_reg_sr[ 199: 192] <= ssw_data;
+                    5'd25: load_vdp_reg_sr[ 207: 200] <= ssw_data;
+                    5'd26: load_vdp_reg_sr[ 215: 208] <= ssw_data;
+                    5'd27: load_vdp_reg_sr[ 223: 216] <= ssw_data;
+                    5'd28: load_vdp_reg_sr[ 231: 224] <= ssw_data;
+                    5'd29: load_vdp_reg_sr[ 239: 232] <= ssw_data;
+                    5'd30: load_vdp_reg_sr[ 247: 240] <= ssw_data;
+                    5'd31: load_vdp_reg_sr[ 255: 248] <= ssw_data;
+                    default: ;
+                endcase
             end
-            // --- Shift-register for VDP STATE ---
+            // --- Direct byte-indexed write for VDP STATE ---
             RGN_VDPST: begin
-                if (ssw_vdp_off[2:0] < 3'd4)
-                    load_vdp_state_sr <= {ssw_data, load_vdp_state_sr[31:8]};
+                case (ssw_vdp_off[2:0])
+                    3'd0: load_vdp_state_sr[  7:  0] <= ssw_data;
+                    3'd1: load_vdp_state_sr[ 15:  8] <= ssw_data;
+                    3'd2: load_vdp_state_sr[ 23: 16] <= ssw_data;
+                    3'd3: load_vdp_state_sr[ 31: 24] <= ssw_data;
+                    default: ; // bytes 4-7 are status/padding, skip
+                endcase
             end
             // --- CRAM inline write ---
             RGN_CRAM: begin
@@ -761,13 +974,12 @@ end
 // -----------------------------------------------------------------------
 // LOAD: memory write path (combinatorial, gated by ssw_en)
 // -----------------------------------------------------------------------
-// Gate memory writes with ss_halt: ensures all three bulk RAMs are only
-// written while the CPUs are paused.  The early-halt logic below asserts
-// ss_halt on the very first ssw_en byte (the 16-byte header precedes any
-// WRAM/VRAM data), so by the time real RAM bytes arrive ss_halt is already 1.
-wire ssw_in_wram   = ssw_en && (ssw_region_c == RGN_WRAM)   && ss_halt;
-wire ssw_in_vram   = ssw_en && (ssw_region_c == RGN_VRAM)   && ss_halt;
-wire ssw_in_z80ram = ssw_en && (ssw_region_c == RGN_Z80RAM) && ss_halt;
+// DIAGNOSTIC: removed ss_halt gate to test if VRAM writes work without it.
+// If this fixes the empty-VRAM issue, the ss_halt timing is wrong.
+// TODO: restore ss_halt gate once root cause is identified.
+wire ssw_in_wram   = ssw_en && (ssw_region_c == RGN_WRAM);
+wire ssw_in_vram   = ssw_en && (ssw_region_c == RGN_VRAM);
+wire ssw_in_z80ram = ssw_en && (ssw_region_c == RGN_Z80RAM);
 
 // VRAM accumulation buffer: VRAM port B is 32-bit with a single wren_b for all
 // byte lanes, so we must assemble 4 bytes before committing a write.
@@ -820,6 +1032,18 @@ always @(*) begin
         ss_z80ram_di   = 8'h0;
     end
 end
+
+// VRAM port B ownership: high during active save/load data transfer.
+// Includes the early-halt phase (ss_halt=1 in ST_IDLE before load_start)
+// where data_loader is streaming bytes into WRAM/VRAM/Z80RAM.
+// After load completes, header_match_cnt is cleared (→ !header_validated),
+// so ss_vram_sel drops even though ss_halt stays high for PAUSE_EN.
+// This releases port B back to the VDP for tile reads.
+assign ss_vram_sel = (state != ST_IDLE) || (ss_halt && header_validated);
+
+// ss_loading: high during any load-related activity (early data streaming + FSM)
+// Used by system.sv to reset Z80 and bus state machines ONLY during load, not save.
+assign ss_loading = load_busy || (ss_halt && header_validated);
 
 // -----------------------------------------------------------------------
 endmodule

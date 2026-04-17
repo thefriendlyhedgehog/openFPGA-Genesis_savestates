@@ -315,7 +315,7 @@ always @(*) begin
 	if (bridge_addr[31:28] == 4'h6) begin
       bridge_rd_data <= sd_read_data;
     end
-    if (bridge_addr[31:28] == 4'h5) begin
+    if (bridge_addr[31:28] == 4'h4) begin
       bridge_rd_data <= ss_bridge_rd_data;
     end
 end
@@ -351,7 +351,7 @@ end
     wire    [31:0]  savestate_maxloadsize;
 
     assign savestate_supported   = 1'b1;
-    assign savestate_addr        = 32'h50000000;
+    assign savestate_addr        = 32'h40000000;
     assign savestate_size        = 32'h00022590;
     assign savestate_maxloadsize = 32'h00022590;
 
@@ -616,7 +616,7 @@ wire [17:0] ssr_addr;
 wire  [7:0] ssr_data;
 
 data_unloader #(
-    .ADDRESS_MASK_UPPER_4(4'h5),
+    .ADDRESS_MASK_UPPER_4(4'h4),
     .ADDRESS_SIZE(18),
     .READ_MEM_CLOCK_DELAY(1),
     .INPUT_WORD_SIZE(1)
@@ -640,7 +640,7 @@ wire [17:0] ssw_addr;
 wire  [7:0] ssw_data;
 
 data_loader #(
-    .ADDRESS_MASK_UPPER_4(4'h5),
+    .ADDRESS_MASK_UPPER_4(4'h4),
     .ADDRESS_SIZE(18),
     .WRITE_MEM_CLOCK_DELAY(4),
     .OUTPUT_WORD_SIZE(1)
@@ -666,6 +666,8 @@ wire         ss_wram_we_u, ss_wram_we_l;
 wire [15:0]  ss_wram_di,   ss_wram_do;
 wire [13:0]  ss_vram_addr;
 wire         ss_vram_we;
+wire         ss_vram_sel;   // VRAM port B ownership (active save/load only)
+wire         ss_loading;    // high during load operations only (not save)
 wire [31:0]  ss_vram_di,   ss_vram_do;
 wire [12:0]  ss_z80ram_addr;
 wire         ss_z80ram_we;
@@ -719,6 +721,8 @@ savestate_ctrl ssctrl (
 
     .vbus_sel   (ss_vbus_sel),
     .ss_halt    (ss_halt),
+    .ss_vram_sel(ss_vram_sel),
+    .ss_loading (ss_loading),
 
     .ssr_en     (ssr_en),
     .ssr_addr   (ssr_addr),
@@ -1435,6 +1439,8 @@ system system
 	.SPR_EN(1),
 
 	.SS_BUSY            (ss_halt),
+	.SS_LOADING         (ss_loading),
+	.SS_VRAM_SEL        (ss_vram_sel),
 	.SS_WRAM_ADDR       (ss_wram_addr),
 	.SS_WRAM_WE_U       (ss_wram_we_u),
 	.SS_WRAM_WE_L       (ss_wram_we_l),

@@ -3605,6 +3605,10 @@ begin
 			PENDING <= SS_VDP_STATE_IN(23);
 			CODE    <= SS_VDP_STATE_IN(22 downto 17);
 			ADDR    <= SS_VDP_STATE_IN(16 downto 0);
+			-- DMA/FIFO reset removed: causes rendering corruption in
+			-- same-session tests (shapes displaced, wrong colors).
+			-- TODO: for cross-session restore, save/restore full DMA
+			-- state instead of blindly resetting to IDLE.
 		end if;
 
 		-- Save-state: CRAM direct write (port A hijack, system halted so DTC is idle)

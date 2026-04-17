@@ -139,7 +139,9 @@ module system
 	// -------------------------------------------------------
 	// Save-state bus (from savestate_ctrl in core_top.sv)
 	// -------------------------------------------------------
-	input         SS_BUSY,           // system is halted for savestate
+	input         SS_BUSY,           // system is halted for savestate (save OR load)
+	input         SS_LOADING,       // high only during LOAD (not save) — for Z80/bus reset
+	input         SS_VRAM_SEL,      // savestate needs VRAM port B (active transfer only)
 
 	// WRAM (68K main RAM) port B
 	input  [14:0] SS_WRAM_ADDR,
@@ -416,8 +418,11 @@ wire [15:1] vram32_a;
 wire [31:0] vram32_q;
 
 // VRAM port B: mux among LOADING reset, savestate, and normal vram32 DMA reads
-wire [13:0] vram_b_addr = LOADING ? ram_rst_a[14:1] : SS_BUSY ? SS_VRAM_ADDR : vram32_a[15:2];
-wire        vram_b_we   = LOADING | (SS_BUSY & SS_VRAM_WE);
+// SS_VRAM_SEL controls port B ownership during active save/load data transfer.
+// When save/load is done (SS_VRAM_SEL=0), port B returns to VDP for rendering
+// even if SS_BUSY stays high for PAUSE_EN.
+wire [13:0] vram_b_addr = LOADING ? ram_rst_a[14:1] : SS_VRAM_SEL ? SS_VRAM_ADDR : vram32_a[15:2];
+wire        vram_b_we   = LOADING | (SS_VRAM_SEL & SS_VRAM_WE);
 
 dpram #(14) vram_l1
 (
@@ -927,7 +932,7 @@ always @(posedge MCLK) begin
 		VDP_MBUS_DTACK_N  <= 1;
 		VDP_SEL <= 0;
 		IO_SEL <= 0;
-		SVP_SEL <= 0; 
+		SVP_SEL <= 0;
 		ZBUS_SEL <= 0;
 		BANK_ROM <= 0;
 		BANK_SRAM <= 0;
@@ -936,6 +941,21 @@ always @(posedge MCLK) begin
 		MBUS_RNW <= 1;
 		NO_DATA <= 'h4E71;
 		BANK_REG <= '{0,1,2,3,4,5,6,7};
+	end
+	else if (SS_LOADING) begin
+		// During savestate LOAD: force bus state machines to idle.
+		// Prevents stale bus cycles from blocking the 68K on resume.
+		// Only during load — save needs the bus to stay frozen-in-place
+		// so it resumes cleanly when save completes.
+		M68K_MBUS_DTACK_N <= 1;
+		Z80_MBUS_DTACK_N  <= 1;
+		VDP_MBUS_DTACK_N  <= 1;
+		VDP_SEL <= 0;
+		IO_SEL <= 0;
+		SVP_SEL <= 0;
+		ZBUS_SEL <= 0;
+		mstate <= MBUS_IDLE;
+		MBUS_RNW <= 1;
 	end
 	else begin
 	/*
@@ -1305,6 +1325,16 @@ wire        Z80_IO = ~Z80_MREQ_N & (~Z80_RD_N | ~Z80_WR_N);
 T80s #(.T2Write(1)) Z80
 //T80pa Z80
 (
+	// RESET_n must stay HIGH during savestate LOAD so DIRSet can actually
+	// load the Z80 state. T80.vhd's main state-machine processes use an
+	// async "if RESET_n = '0' then PC <= 0" block — the DIRSet handler is
+	// in the elsif branch and is unreachable while RESET_n is low. If we
+	// hold RESET_n low during load, the DIRSet pulse is swallowed and the
+	// Z80 resumes from PC=0 instead of the saved PC, re-initializing the
+	// sound driver (audible as glitched audio) and potentially writing
+	// garbage to the VDP during reinit. PAUSE_EN already gates Z80_CLKEN
+	// to 0 throughout ss_halt, so the Z80 is clock-stopped during load
+	// regardless — we do not need the extra reset.
 	.RESET_n(Z80_RESET_N),
 	.CLK(MCLK),
 //	.CEN_p(Z80_CLKENp),
@@ -1403,11 +1433,11 @@ always @(posedge MCLK) begin
 
 	ZBUS_WE <= 0;
 	
-	if (reset) begin
+	if (reset || SS_LOADING) begin
 		MBUS_ZBUS_DTACK_N <= 1;
 		Z80_ZBUS_DTACK_N  <= 1;
 		zstate <= ZBUS_IDLE;
-		
+
 		Z80_BR_N <= 1;
 		Z80_BGACK_N <= 1;
 		Z80_BGACK_DIS <= 0;

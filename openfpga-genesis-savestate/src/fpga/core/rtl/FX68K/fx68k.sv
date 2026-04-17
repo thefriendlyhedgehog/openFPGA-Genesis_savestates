@@ -1694,7 +1694,12 @@ localparam REG_DT = 17;
 
 	always_ff @( posedge Clks.clk) begin
 		if( ss_state_load) begin
-			for (ss_ri = 0; ss_ri < 18; ss_ri = ss_ri + 1) begin
+			// Load D0-D7, A0-A7, USP, SSP only (indices 0-16).
+			// Skip REG_DT (index 17): parent wiring truncates ss_regs_in
+			// to [543:0] (544 bits = 17 regs), so bits [575:544] are zero.
+			// Loading zero into DT clobbers the live temporary register
+			// and crashes the CPU mid-instruction.
+			for (ss_ri = 0; ss_ri < 17; ss_ri = ss_ri + 1) begin
 				regs68L[ss_ri] <= ss_regs_in[ss_ri*32 +: 16];
 				regs68H[ss_ri] <= ss_regs_in[ss_ri*32+16 +: 16];
 			end
